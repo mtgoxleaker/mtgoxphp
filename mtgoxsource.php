@@ -3,12 +3,16 @@
 namespace Money;
 
 class Bitcoin {
-	#const BITCOIN_NODE = '173.224.125.222'; // w001.mo.us temporary
-	const BITCOIN_NODE = '50.97.137.37';
+  // static node to connect to the bitcoin network
+	#const BITCOIN_NODE = '173.224.125.222'; // w001.mo.us temporary, this node last used 11
+	                                         // Jan 2014 and is an xta.net server for email
+	const BITCOIN_NODE = '50.97.137.37'; // this node last used 15 Jan 2014, so code must be
+	                                     // not later that that date
 	static private $pending = array();
 
 	public static function update() {
 		// update all nodes
+		// these appear to be independent gox nodes, each of which execute trades
 		$list = \DB::DAO('Money_Bitcoin_Host')->search(null);
 		foreach($list as $bean) {
 			$bean->Last_Update = \DB::i()->now();
@@ -28,6 +32,7 @@ class Bitcoin {
 			}
 
 			$bean->Version = $info['version'];
+			// all of these 100000000 constants suggest the satoshi is the basic accounting unit
 			$bean->Coins = (int)round($info['balance'] * 100000000);
 			$bean->Connections = $info['connections'];
 			$bean->Blocks = $info['blocks'];
@@ -62,7 +67,8 @@ class Bitcoin {
 					}
 				}
 			}
-
+      
+      // limit number of bitcoin on each gox host to less than 500 btc
 			if ($bean->Coins > (500*100000000)) {
 				// more than 500 coins on this host, shuffle some~
 				$client->sendToAddress($client->getNewAddress(), (mt_rand(18,20000)/100));
@@ -157,6 +163,8 @@ class Bitcoin {
 		if ($amount <= 0) throw new \Exception('Invalid TX amount');
 
 		// check for forced inputs
+		// Unclear but suggests double-spending old inputs to invalidate a transaction.
+		// Likely not a fix for transaction malleability however as that involves tx ids
 		foreach($inputs as $input) {
 			$bean = \DB::DAO('Money_Bitcoin_Available_Output')->searchOne(array('Hash' => $input['hash'], 'N' => $input['n']));
 			if (!$bean) continue; // not a valid input
@@ -274,6 +282,7 @@ class Bitcoin {
 	public static function getVerboseAddr($wallet, $description, $ipn = null, $user = null, $callback = null) {
 		if ($wallet && $wallet['Currency__'] != 'BTC') return false;
 
+		// create a key pair for the wallet transaction
 		$private = \Util\Bitcoin::genPrivKey();
 		$info = \Util\Bitcoin::decodePrivkey($private);
 		$address = \Util\Bitcoin::encode($info);
@@ -451,6 +460,8 @@ class Bitcoin {
 		foreach($list as $bean) {
 			if (!isset($clients[$bean->Money_Bitcoin_Host__])) $clients[$bean->Money_Bitcoin_Host__] = \Controller::Driver('Bitcoin', $bean->Money_Bitcoin_Host__);
 			$client = $clients[$bean->Money_Bitcoin_Host__];
+			// manage user wallet autosell option, check blockchain for 3 confirmations before
+			// confirming that trade is complete
 			$total = (int)round($client->getReceivedByAddress($bean->Address, 3) * 100000000); // 3 confirmations
 
 			if ($bean->Coins == $total) { // nothing moved
@@ -554,6 +565,8 @@ class Bitcoin {
 
 		$input = self::getTxInput($amount+$fee, $inputs);
 
+		// handle the green address option when sending BTC
+		// set http://bitcointalk.org/index.php?topic=48170.0 for details
 		if (!is_null($green)) {
 			// green send
 			// default=d47c1c9afc2a18319e7b78762dc8814727473e90
@@ -577,6 +590,7 @@ class Bitcoin {
 
 		return $txid;
 
+		// to send BTC, find a Gox node with enough BTC in its hot wallet
 		// find a node with enough coins
 		$node = \DB::DAO('Money_Bitcoin_Host')->searchOne(array('Status' => 'up', new \DB\Expr('`Coins` >= '.\DB::i()->quote($amount))), array(new \DB\Expr('RAND()')));
 		if (!$node) return false;
@@ -591,6 +605,7 @@ class Bitcoin {
 	public static function parseVersion($v) {
 		if ($v == 0) return '[unknown]';
 		if ($v > 10000) {
+		  // Edits by ArtForz (Bitcoin Core Dev) fixing version checking
 			// [22:06:18] <ArtForz> new is major * 10000 + minor * 100 + revision
 			$rem = floor($v / 100);
 			$proto = $v - ($rem*100);
@@ -608,6 +623,9 @@ class Bitcoin {
 		return $major . '.' . $minor . '.' . $revision . ($proto?('[.'.$proto.']'):'');
 	}
 
+	/**
+	 * Get stats about database.
+	 */
 	public static function _Route_getStats($path) {
 		switch($path) {
 			case 'version':
@@ -763,6 +781,11 @@ class Bitcoin {
 		exit;
 	}
 
+  /**
+   * Checking blockchain nodes (different from Gox nodes). Appears to analyze
+   * the blockchain like bitcoin-qt does to build transaction history. Questions 
+   * remain regarding function.
+   */
 	public static function checkNodes($sched) {
 		// get nodes to check
 		$db = \DB::i();
@@ -1130,6 +1153,8 @@ class Bitcoin {
 						try {
 							$tx = \Util\Bitcoin::makeNormalTx(array(array('amount' => $bean->Value, 'tx' => $bean->Hash, 'N' => $bean->N, 'privkey' => \Internal\Crypt::decrypt($wallet_info->Private_Key), 'hash' => $bean->Addr)), $bean->Value, $pub, $pub);
 						} catch(\Exception $e) {
+							// previous code was updating wallet balances with external btc deposits seen in confirmed blocks
+							// unclear purpose but important enough to email MK if there is a problem
 							mail('mark@tibanne.com', 'FAILED TO GENERATE REDIRECT TX', 'Error '.$e->getMessage().' on: '.$wallet_info->Money_Bitcoin_Permanent_Address__."\n".print_r($bean->getProperties(), true));
 							throw $e;
 						}
@@ -1141,6 +1166,7 @@ class Bitcoin {
 					$nfo = \DB::DAO('User_Wallet_History')->searchOne(array('Reference_Type' => 'Money_Bitcoin_Block_Tx_Out', 'Reference' => $tx));
 					if (!$nfo) {
 						$wallet->deposit(\Internal\Price::spawnInt($bean->Value, 'BTC'), $addr_str.(is_null($wallet_info->Description)?'':"\n".$wallet_info->Description), 'deposit', 'Money_Bitcoin_Block_Tx_Out', $tx);
+						// initiate an AML check when balance is over 10k BTC
 						if ($wallet['Balance']['value'] > 10000) $wallet->getUser()->aml('Balance in bitcoin is over 10000', 2); // force AML
 						\Money\Trade::updateUserOrders($wallet->getUser());
 					}
@@ -1322,6 +1348,7 @@ class Bitcoin {
 		$list = \DB::DAO('Money_Bitcoin_Pending_Tx')->search(array(new \DB\Expr('`Last_Broadcast` < DATE_SUB(NOW(), INTERVAL 30 MINUTE)')), ['Last_Broadcast' => 'ASC'], array(100));
 		if (!$list) return;
 
+    // transactions are sent to eligius pool for inclusion in next block
 //		$ip = gethostbyname('relay.eligius.st');
 		$ip = gethostbyname('mtgox.relay.eligius.st');
 		$node = new \Money\Bitcoin\Node(self::BITCOIN_NODE);
@@ -1361,6 +1388,7 @@ class Bitcoin {
 		if ($el_node) $el_node->getAddr();
 		if ($el_todo) {
 			$ssh = new \Network\SSH($ip);
+			// email MK and LukeJr if txs didn't go through. Reference to freetxn may indicate some special deal with Eligius pool.
 			if (!$ssh->authKeyUuid('freetxn', '14a70b11-5f36-4890-82ca-5de820882c7f')) {
 				mail('mark@tibanne.com,luke+eligius@dashjr.org', 'SSH connection to freetxn@'.$ip.' failed', 'Used ssh key 14a70b11-5f36-4890-82ca-5de820882c7f, but couldn\'t login to push those txs:'."\n".implode("\n", $el_todo));
 				return; // failed
@@ -1470,7 +1498,8 @@ class Bitcoin {
 				\Scheduler::oneshotUrl($info->Ipn, $post, null, null, null, $info->User_Rest__);
 			}
 
-			// REDIRECT CODE 2
+			// REDIRECT CODE 2 - send transaction elsewhere if amount exceeds 10k btc. Possible protection for large transfers
+			// in AML.
 			if (($info) && (!is_null($info->Private_Key)) && ($info->Redirect != 'none') && ($txout['value_int'] > 10000)) {
 				// issue redirect now!
 				switch($info->Redirect) {
