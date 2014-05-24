@@ -7,18 +7,25 @@ class Bitcoin {
 	#const BITCOIN_NODE = '173.224.125.222'; // w001.mo.us temporary, this node last used 11
 	                                         // Jan 2014 and is an xta.net server for email
 	const BITCOIN_NODE = '50.97.137.37'; // this node last used 15 Jan 2014, so code must be
-	                                     // not later that that date
+	                                     // not later than that date
 	static private $pending = array();
 
+  /**
+   * Update information about all bitcoin-qt daemons this Gox node talks to,
+   * distributing bitcoin amongst them if needed.
+   *
+   * This function is run every 10 minutes by the scheduler.
+   */
 	public static function update() {
-		// update all nodes
-		// these appear to be independent gox nodes, each of which execute trades
 		$list = \DB::DAO('Money_Bitcoin_Host')->search(null);
 		foreach($list as $bean) {
 			$bean->Last_Update = \DB::i()->now();
 			$client = \Controller::Driver('Bitcoin', $bean->Money_Bitcoin_Host__);
 			if (!$client->isValid()) continue;
+			
+			// obtain getinfo result from bitcoin-core rpc call
 			$info = $client->getInfo();
+			// if can't communicate, mark that daemon as down
 			if (!$info) {
 				$bean->Status = 'down';
 				$bean->commit();
@@ -32,7 +39,7 @@ class Bitcoin {
 			}
 
 			$bean->Version = $info['version'];
-			// all of these 100000000 constants suggest the satoshi is the basic accounting unit
+			// internal tracking of balances is in integer number of Satoshi
 			$bean->Coins = (int)round($info['balance'] * 100000000);
 			$bean->Connections = $info['connections'];
 			$bean->Blocks = $info['blocks'];
@@ -49,14 +56,15 @@ class Bitcoin {
 				}
 				$bean->commit();
 			}
-
+      
+      // If should keep address empty and there is more than 1 BTC on daemon, try to send
+      // to new address.
 			if (($bean->Keep_Empty == 'Y') && ($bean->Coins > 100000000)) {
-				// empty it!
-				$addr = self::getNullAddr();
+				$addr = self::getNullAddr(); // get new empty address
 				try {
 					$client->sendToAddress($addr, $bean->Coins / 100000000);
 				} catch(\Exception $e) {
-					// try smaller amount (maybe failed because of fee)
+					// try 1/4 of that amount if failed (maybe failed because of fee)
 					try {
 						$c = $bean->Coins / 100000000;
 						$c = round($c/4, 2);
@@ -68,9 +76,9 @@ class Bitcoin {
 				}
 			}
       
-      // limit number of bitcoin on each gox host to less than 500 btc
+      // limit number of bitcoin on each daemon to less than 500 btc
 			if ($bean->Coins > (500*100000000)) {
-				// more than 500 coins on this host, shuffle some~
+				// more than 500 coins on this host, move between 0.18 and 200 BTC
 				$client->sendToAddress($client->getNewAddress(), (mt_rand(18,20000)/100));
 			}
 		}
@@ -87,18 +95,30 @@ class Bitcoin {
 		\DB::DAO('Currency_History')->insert(array('Currency__' => $btc->Currency__, 'Date' => gmdate('Y-m-d'), 'Ex_Bid' => $btc->Ex_Bid, 'Ex_Ask' => $btc->Ex_Ask));
 	}
 
+  /**
+   * Function to merge unspent outputs smaller than 1 BTC.
+   *
+   * Will try and merge all outputs smaller than 1 BTC onto an address with at least 1 BTC.
+   * 
+   * This function is run every 10 minutes by the scheduler.
+   * 
+   * @return true if succeeded, false otherwise
+   */
 	public static function mergeSmallOutputs() {
 		$transaction = \DB::i()->transaction();
 		$lock = \DB::i()->lock('Money_Bitcoin_Available_Output');
-
+    
+    // gather list of Available_Output less than 1 BTC
 		$list = \DB::DAO('Money_Bitcoin_Available_Output')->search(array('Available' => 'Y', new \DB\Expr('`Value` < 100000000')), null, array(5));
 		if (count($list) < 3) return false;
-
+    
+    // add one output with more than 1 BTC, if available
 		$list[] = \DB::DAO('Money_Bitcoin_Available_Output')->searchOne(['Available' => 'Y', new \DB\Expr('`Value` > 100000000')]);
 
-		$input = array();
+		$input = array();  // really an array of many inputs
 		$amount = 0;
 		foreach($list as $bean) {
+		  // get corresponding Available_Output's Permanent_Address object and check it
 			$key = \DB::DAO('Money_Bitcoin_Permanent_Address')->searchOne(array('Money_Bitcoin_Permanent_Address__' => $bean->Money_Bitcoin_Permanent_Address__));
 			if (!$key) throw new \Exception('Unusable output');
 			$tmp = array(
@@ -112,27 +132,36 @@ class Bitcoin {
 			$input[] = $tmp;
 			$amount += $bean->Value;
 			$bean->Available = 'N';
-			$bean->commit();
+			$bean->commit(); // possible bitcoin leak as have committed not available before transmitting transaction
 		}
+		
+		// get new empty address to transfer bitcoin to
 		$output = \Money\Bitcoin::getNullAddr();
 		$output = \Util\Bitcoin::decode($output);
 		if (!$output) return false;
 
 		$tx = \Util\Bitcoin::makeNormalTx($input, $amount, $output, $output);
-		self::publishTransaction($tx);
+		self::publishTransaction($tx);  // no check on ultimate successful transmission
 		return $transaction->commit();
 	}
-
+  
+  /**
+   * Split available outputs greater than 10 BTC into two parts.
+   *
+   * This function is run every 10 minutes by the scheduler.
+   */
 	public static function splitBigOutputs() {
 		$transaction = \DB::i()->transaction();
 		$lock = \DB::i()->lock('Money_Bitcoin_Available_Output');
 
+    // find one output larger than 10 BTC
 		$bean = \DB::DAO('Money_Bitcoin_Available_Output')->searchOne(array('Available' => 'Y', new \DB\Expr('`Value` > 1000000000')));
 		if (!$bean) return;
 
 		$input = array();
 		$amount = 0;
 
+    // construct input for transaction using large output
 		$key = \DB::DAO('Money_Bitcoin_Permanent_Address')->searchOne(array('Money_Bitcoin_Permanent_Address__' => $bean->Money_Bitcoin_Permanent_Address__));
 		if (!$key) throw new \Exception('Unusable output');
 		$tmp = array(
@@ -146,12 +175,16 @@ class Bitcoin {
 		$input[] = $tmp;
 		$amount += $bean->Value;
 		$bean->Available = 'N';
-		$bean->commit();
+		$bean->commit();  // possible bitcoin leak as commits not available before transaction is transmitted.
 
+    // get two new addresses with no bitcoin in them
 		$output1 = \Util\Bitcoin::decode(\Money\Bitcoin::getNullAddr());
 		$output2 = \Util\Bitcoin::decode(\Money\Bitcoin::getNullAddr());
 
+    // construct tx splitting into two parts, one between 40-50% of current output and 
+    // the other the remainder
 		$tx = \Util\Bitcoin::makeNormalTx($input, round(mt_rand($amount*0.4, $amount*0.6)), $output1, $output2);
+		// publish and commit the transaction
 		self::publishTransaction($tx);
 		return $transaction->commit();
 	}
@@ -258,6 +291,13 @@ class Bitcoin {
 		return \Money\Bitcoin\Address::byHash($info['hash']);
 	}
 
+  /**
+   * Generate a new private key and address with no bitcoin in it.
+   * 
+   * @param priv true if should return array with private key, false to return address only.
+   * 
+   * @return array of (key,info,address) if priv = true, address if priv = false, false if error.
+   */
 	public static function getNullAddr($priv = false) {
 		$private = \Util\Bitcoin::genPrivKey();
 		$info = \Util\Bitcoin::decodePrivkey($private);
@@ -1272,33 +1312,53 @@ class Bitcoin {
 		return array('amount' => \Internal\Price::spawnInt($total, 'BTC'), 'address' => $addr);
 	}
 
+  /**
+   * Build transactions to transfer amount from list of inputs to output with remainder,
+   * using a specified fee.
+   *
+   * Creates new Available_Output database entries for any intermediate transactions
+   * which are generated.
+   * 
+   * @param input list of inputs to use
+   * @param amount of output of final transaction
+   * @param final_output address to output to
+   * @param remainder address for remainder
+   * @param fee to include in final transaction, default is 0
+   * @return list of transactions to produce desired output
+   */
 	public static function makeNormalTx($input, $amount, $final_output, $remainder, $fee = 0) {
-		// make a normal tx, merge inputs if preferable
 		$res = array();
+		
+		// while there are more than 5 inputs, try to merge them
 		while(count($input) > 5) {
-			// merge some inputs
 			$xinput = array();
-			$output = self::getNullAddr(true);
+			$output = self::getNullAddr(true); // obtain new empty address
 
-			// merge as many inputs as we can in a single tx
+			// merge as many inputs as we can, while character length of the transaction < 1000
 			while(true) {
+			  // move next input onto tinput array for checking length
 				$extra = array_shift($input);
 				if (is_null($extra)) break;
 				$tinput = $xinput;
 				$tinput[] = $extra;
 				$total = 0;
 				foreach($tinput as $t) $total+=$t['amount'];
+				// construct transaction to check its length
 				$ttx = \Util\Bitcoin::makeNormalTx($tinput, $total, $output['info'], $output['info']);
+				// stop when length of transaction for all of tinput inputs is greater than 1000
 				if (strlen($ttx) >= 1000) break;
 				$xinput[] = $extra;
 			}
-			if (!is_null($extra))
+			if (!is_null($extra)) // put last input tested back
 				array_unshift($input, $extra);
+				
 			$total = 0;
 			foreach($xinput as $t) $total += $t['amount'];
+			// construct transaction for the inputs on the xinput list
 			$ttx = \Util\Bitcoin::makeNormalTx($xinput, $total, $output['info'], $output['info']);
 			$res[] = $ttx;
 			$thash = bin2hex(strrev(\Util\Bitcoin::hash_sha256(\Util\Bitcoin::hash_sha256($ttx))));
+			// put this output on the list of now available inputs
 			$input[] = array(
 				'amount' => $total,
 				'tx' => $thash,
@@ -1306,13 +1366,23 @@ class Bitcoin {
 				'privkey' => $output['priv'],
 				'hash' => $output['info']['hash'],
 			);
+			// insert new Available_Output entry for this transaction, marked unavailable
+			// possible leak here because these transactions have not yet been transmitted on the blockchain
 			\DB::DAO('Money_Bitcoin_Available_Output')->insert(array('Money_Bitcoin_Available_Output__' => \System::uuid(), 'Money_Bitcoin_Permanent_Address__' => $output['info']['hash'], 'Value' => $total, 'Hash' => $thash, 'N' => 0, 'Available' => 'N'));
 		}
-		// do the final tx
+		
+		// add the final tx to the final_output destination
 		$res[] = \Util\Bitcoin::makeNormalTx($input, $amount, $final_output, $remainder, $fee);
 		return $res;
 	}
 
+  /**
+   * Place transaction or list of transactions into Pending_Tx table for transmission and
+   * global $pending array on this Gox node.
+   * 
+   * @param $txs single transaction or array of them
+   * @return transaction id of last transaction in list
+   */
 	public static function publishTransaction($txs) {
 		// generate tx id
 		if (!is_array($txs)) $txs = array($txs);
@@ -1380,7 +1450,7 @@ class Bitcoin {
 			} catch(\Exception $e) {
 				$bean->Last_Result = $e->getMessage();
 			}
-			$bean->commit();
+			$bean->commit(); 
 			$node->pushTx(base64_decode($bean->Blob));
 		}
 
@@ -1402,9 +1472,9 @@ class Bitcoin {
 	}
 
 	/**
-	 * Returns the total amount of bitcoins in the world based on that last block generated
+	 * Returns the total amount of bitcoins in all tracked blocks based on that last block generated
 	 *
-	 * @return int The total amount of bitcoins
+	 * @return int The total amount of bitcoins, in Satoshi
 	 */
 	public static function getTotalCount() {
 		// get total count of BTC in the world based on latest block #
@@ -1523,8 +1593,14 @@ class Bitcoin {
 		die('OK');
 	}
 
+  /**
+   * Return array of arrays describing the structure of the database.
+   * 
+   * Each element is named starting with Money_Bitcoin_, like the name of this class.
+   */
 	public static function getTablesStruct() {
 		return array(
+		  // Bitcoin-qt daemons which this Gox node talks to
 			'Money_Bitcoin_Host' => array(
 				'Money_Bitcoin_Host__' => 'UUID',
 				'Name' => array('type' => 'VARCHAR', 'size' => 16, 'null' => false),
@@ -1588,7 +1664,8 @@ class Bitcoin {
 					'User_Wallet__' => ['User_Wallet__'],
 				),
 			),
-			'Money_Bitcoin_Available_Output' => array( // list available funds
+			// tracks available unspent outputs
+			'Money_Bitcoin_Available_Output' => array(
 				'Money_Bitcoin_Available_Output__' => 'UUID',
 				'Money_Bitcoin_Permanent_Address__' => array('type' => 'CHAR', 'size' => 40, 'key' => 'Money_Bitcoin_Permanent_Address__'),
 				'Network' => array('type' => 'VARCHAR', 'size' => 32, 'default' => 'bitcoin', 'key' => 'Network'),
@@ -1652,6 +1729,7 @@ class Bitcoin {
 					'Status' => ['Status'],
 				],
 			),
+			// list of all transactions which need transmission on the network
 			'Money_Bitcoin_Pending_Tx' => array(
 				'Hash' => array('type' => 'CHAR', 'size' => 64, 'null' => false, 'key' => 'PRIMARY'),
 				'Network' => array('type' => 'VARCHAR', 'size' => 32, 'default' => 'bitcoin', 'key' => 'Network'),
@@ -1736,6 +1814,9 @@ class Bitcoin {
 	}
 }
 
+/**
+ * Schedule execution of functions on a periodic basis for this Gox node.
+ */
 \Scheduler::schedule('MoneyBitcoinUpdate', '10min', 'Money/Bitcoin::update');
 \Scheduler::schedule('MoneyBitcoinCheckOrders', '5min', 'Money/Bitcoin::checkOrders');
 \Scheduler::schedule('MoneyBitcoinGetRate', array('daily', '5i'), 'Money/Bitcoin::getRate');
@@ -1745,4 +1826,6 @@ class Bitcoin {
 \Scheduler::schedule('MoneyBitcoinBroadcastTxs', '1min', 'Money/Bitcoin::broadcastTransactions');
 \Scheduler::schedule('MoneyBitcoinMergeSmallOutputs', '10min', 'Money/Bitcoin::mergeSmallOutputs');
 \Scheduler::schedule('MoneyBitcoinSplitBigOutputs', '10min', 'Money/Bitcoin::splitBigOutputs');
+
+// validate structure of tables on startup
 \DB::i()->validateStruct(Bitcoin::getTablesStruct());
